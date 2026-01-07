@@ -1,5 +1,4 @@
 """
-
 A rocket powered landing with successive convexification
 
 author: Sven Niederberger
@@ -13,11 +12,15 @@ by Michael Szmuk and Behcet Acıkmese.
 
 """
 import warnings
-from time import time
+from time import time, perf_counter_ns
 import numpy as np
-from scipy.integrate import odeint
+from scipy.integrate import odeint, solve_ivp
 import cvxpy
 import matplotlib.pyplot as plt
+from functools import lru_cache, wraps
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Callable, List, Tuple
+from enum import Enum
 
 # Trajectory points
 K = 50
@@ -38,6 +41,43 @@ verbose_solver = False
 show_animation = True
 
 
+class ConvergenceMode(Enum):
+    STRICT = 1
+    RELAXED = 2
+    ADAPTIVE = 3
+
+
+@dataclass
+class OptimizationMetrics:
+    iteration: int
+    delta_norm: float
+    sigma_norm: float
+    nu_norm: float
+    solve_time: float
+    converged: bool = False
+
+
+def timing_decorator(threshold_ms: float = 10.0):
+    """Сложный декоратор с замыканием для замера времени выполнения (строки 57-69)"""
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            start = perf_counter_ns()
+            result = func(*args, **kwargs)
+            elapsed_ms = (perf_counter_ns() - start) / 1e6
+            
+            if elapsed_ms > threshold_ms:
+                print(f"🕒 {func.__name__} took {elapsed_ms:.2f} ms (exceeded {threshold_ms} ms)")
+            
+            # Нетипичное: побочный эффект в декораторе - модификация аргументов
+            if kwargs and 'verbose' in kwargs and kwargs['verbose']:
+                kwargs['verbose'] = False  # Необычное изменение флага
+                
+            return result
+        return wrapper
+    return decorator
+
+
 class Rocket_Model_6DoF:
     """
     A 6 degree of freedom rocket landing problem.
@@ -46,7 +86,7 @@ class Rocket_Model_6DoF:
     def __init__(self, rng):
         """
         A large r_scale for a small scale problem will
-        ead to numerical problems as parameters become excessively small
+        lead to numerical problems as parameters become excessively small
         and (it seems) precision is lost in the dynamics.
         """
         self.n_x = 14
@@ -92,6 +132,10 @@ class Rocket_Model_6DoF:
         # Vector from thrust point to CoM
         self.r_T_B = np.array([-1e-2, 0., 0.])
 
+        # Кэш для матриц (нетипичное для этого кода) - строка 122
+        self._matrix_cache: Dict[str, np.ndarray] = {}
+        self._cache_enabled = True
+
         self.set_random_initial_state(rng)
 
         self.x_init = np.concatenate(
@@ -106,14 +150,42 @@ class Rocket_Model_6DoF:
         if rng is None:
             rng = np.random.default_rng()
 
+        # Сложная вложенность с условиями (строки 133-152)
+        def compute_initial_component(base_val: float, 
+                                    spread: float,
+                                    constraint_func: Optional[Callable] = None) -> float:
+            """Рекурсивная функция с замыканием для вычисления начальных условий"""
+            val = base_val + rng.uniform(-spread, spread)
+            
+            if constraint_func:
+                max_attempts = 5
+                for attempt in range(max_attempts):
+                    if constraint_func(val):
+                        return val
+                    val = base_val + rng.uniform(-spread, spread)
+                
+                # Необычный паттерн: fallback с лямбда-выражением
+                fallback = (lambda x: x * 0.5 if x > 0 else x * 2.0)(base_val)
+                return fallback if not constraint_func or constraint_func(fallback) else base_val
+            return val
+
         self.r_I_init = np.array((0., 0., 0.))
-        self.r_I_init[0] = rng.uniform(3, 4)
-        self.r_I_init[1:3] = rng.uniform(-2, 2, size=2)
+        self.r_I_init[0] = compute_initial_component(3.5, 0.5, lambda x: 3 <= x <= 4)
+        
+        # Сложная генерация с использованием map и filter (строка 150)
+        init_vals = list(map(
+            lambda idx: compute_initial_component(0, 2, lambda v: -2 <= v <= 2),
+            range(2)
+        ))
+        self.r_I_init[1:3] = np.array(init_vals)
 
         self.v_I_init = np.array((0., 0., 0.))
-        self.v_I_init[0] = rng.uniform(-1, -0.5)
-        self.v_I_init[1:3] = rng.uniform(-0.5, -0.2,
-                                         size=2) * self.r_I_init[1:3]
+        self.v_I_init[0] = compute_initial_component(-0.75, 0.25, lambda x: -1 <= x <= -0.5)
+        
+        # Нетипичное: использование генератора с условием
+        v_components = (self.r_I_init[i] * rng.uniform(-0.5, -0.2) 
+                       for i in range(1, 3))
+        self.v_I_init[1:3] = np.fromiter(v_components, dtype=float)
 
         self.q_B_I_init = self.euler_to_quat((0,
                                               rng.uniform(-30, 30),
@@ -122,12 +194,18 @@ class Rocket_Model_6DoF:
                                     rng.uniform(-20, 20),
                                     rng.uniform(-20, 20)))
 
+    @timing_decorator(threshold_ms=1.0)
     def f_func(self, x, u):
+        """Декорированная версия с замером времени"""
+        cache_key = f"f_{hash(x.tobytes())}_{hash(u.tobytes())}"
+        if self._cache_enabled and cache_key in self._matrix_cache:
+            return self._matrix_cache[cache_key]
+
         m, _, _, _, vx, vy, vz, q0, q1, q2, q3, wx, wy, wz = x[0], x[1], x[
             2], x[3], x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11], x[12], x[13]
         ux, uy, uz = u[0], u[1], u[2]
 
-        return np.array([
+        result = np.array([
             [-0.01 * np.sqrt(ux**2 + uy**2 + uz**2)],
             [vx],
             [vy],
@@ -146,13 +224,25 @@ class Rocket_Model_6DoF:
             [1.0 * uz],
             [-1.0 * uy]
         ])
+        
+        if self._cache_enabled:
+            self._matrix_cache[cache_key] = result
+            # Ограничение размера кэша (необычно для этого кода)
+            if len(self._matrix_cache) > 1000:
+                self._matrix_cache.clear()
+        
+        return result
 
     def A_func(self, x, u):
+        cache_key = f"A_{hash(x.tobytes())}_{hash(u.tobytes())}"
+        if self._cache_enabled and cache_key in self._matrix_cache:
+            return self._matrix_cache[cache_key]
+
         m, _, _, _, _, _, _, q0, q1, q2, q3, wx, wy, wz = x[0], x[1], x[
             2], x[3], x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11], x[12], x[13]
         ux, uy, uz = u[0], u[1], u[2]
 
-        return np.array([
+        result = np.array([
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -174,13 +264,22 @@ class Rocket_Model_6DoF:
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]])
+        
+        if self._cache_enabled:
+            self._matrix_cache[cache_key] = result
+        
+        return result
 
     def B_func(self, x, u):
+        cache_key = f"B_{hash(x.tobytes())}_{hash(u.tobytes())}"
+        if self._cache_enabled and cache_key in self._matrix_cache:
+            return self._matrix_cache[cache_key]
+
         m, _, _, _, _, _, _, q0, q1, q2, q3, _, _, _ = x[0], x[1], x[
             2], x[3], x[4], x[5], x[6], x[7], x[8], x[9], x[10], x[11], x[12], x[13]
         ux, uy, uz = u[0], u[1], u[2]
 
-        return np.array([
+        result = np.array([
             [-0.01 * ux / np.sqrt(ux**2 + uy**2 + uz**2),
              -0.01 * uy / np.sqrt(ux ** 2 + uy**2 + uz**2),
              -0.01 * uz / np.sqrt(ux**2 + uy**2 + uz**2)],
@@ -201,6 +300,11 @@ class Rocket_Model_6DoF:
             [0, 0, 1.0],
             [0, -1.0, 0]
         ])
+        
+        if self._cache_enabled:
+            self._matrix_cache[cache_key] = result
+        
+        return result
 
     def euler_to_quat(self, a):
         a = np.deg2rad(a)
@@ -252,18 +356,49 @@ class Rocket_Model_6DoF:
         """
         K = X.shape[1]
 
+        # Сложная рекурсивная функция для интерполяции (нетипично для этого кода) - строка 335
+        def recursive_interpolate(k_idx, depth=0, max_depth=3):
+            """Рекурсивная интерполяция с ограничением глубины"""
+            if depth > max_depth or k_idx == 0 or k_idx == K-1:
+                alpha1 = (K - k_idx) / K
+                alpha2 = k_idx / K
+                
+                m_k = (alpha1 * self.x_init[0] + alpha2 * self.x_final[0],)
+                r_I_k = alpha1 * self.x_init[1:4] + alpha2 * self.x_final[1:4]
+                v_I_k = alpha1 * self.x_init[4:7] + alpha2 * self.x_final[4:7]
+                q_B_I_k = np.array([1, 0, 0, 0])
+                w_B_k = alpha1 * self.x_init[11:14] + alpha2 * self.x_final[11:14]
+                
+                return np.concatenate((m_k, r_I_k, v_I_k, q_B_I_k, w_B_k)), m_k * -self.g_I
+            else:
+                # Рекурсивное вычисление
+                left_state, left_control = recursive_interpolate(k_idx-1, depth+1, max_depth)
+                right_state, right_control = recursive_interpolate(k_idx+1, depth+1, max_depth)
+                
+                # Необычное усреднение с весами
+                weight_left = 0.7 - 0.1 * depth
+                weight_right = 0.3 + 0.1 * depth
+                
+                state_avg = weight_left * left_state + weight_right * right_state
+                control_avg = weight_left * left_control + weight_right * right_control
+                
+                return state_avg, control_avg
+
         for k in range(K):
-            alpha1 = (K - k) / K
-            alpha2 = k / K
+            if k % 5 == 0:  # Каждый 5-й шаг используем рекурсивную интерполяцию
+                X[:, k], U[:, k] = recursive_interpolate(k)
+            else:
+                alpha1 = (K - k) / K
+                alpha2 = k / K
 
-            m_k = (alpha1 * self.x_init[0] + alpha2 * self.x_final[0],)
-            r_I_k = alpha1 * self.x_init[1:4] + alpha2 * self.x_final[1:4]
-            v_I_k = alpha1 * self.x_init[4:7] + alpha2 * self.x_final[4:7]
-            q_B_I_k = np.array([1, 0, 0, 0])
-            w_B_k = alpha1 * self.x_init[11:14] + alpha2 * self.x_final[11:14]
+                m_k = (alpha1 * self.x_init[0] + alpha2 * self.x_final[0],)
+                r_I_k = alpha1 * self.x_init[1:4] + alpha2 * self.x_final[1:4]
+                v_I_k = alpha1 * self.x_init[4:7] + alpha2 * self.x_final[4:7]
+                q_B_I_k = np.array([1, 0, 0, 0])
+                w_B_k = alpha1 * self.x_init[11:14] + alpha2 * self.x_final[11:14]
 
-            X[:, k] = np.concatenate((m_k, r_I_k, v_I_k, q_B_I_k, w_B_k))
-            U[:, k] = m_k * -self.g_I
+                X[:, k] = np.concatenate((m_k, r_I_k, v_I_k, q_B_I_k, w_B_k))
+                U[:, k] = m_k * -self.g_I
 
         return X, U
 
@@ -307,8 +442,13 @@ class Rocket_Model_6DoF:
         ]
 
         # linearized lower thrust constraint
-        rhs = [U_last_p[:, k] / cvxpy.norm(U_last_p[:, k]) @ U_v[:, k]
-               for k in range(X_v.shape[1])]
+        # Сложная генерация списка с условием (строка 408)
+        rhs = [
+            (U_last_p[:, k] / cvxpy.norm(U_last_p[:, k]) @ U_v[:, k]
+             if cvxpy.norm(U_last_p[:, k]).value > 1e-6
+             else self.T_min * 0.9)  # Fallback значение
+            for k in range(X_v.shape[1])
+        ]
         constraints += [
             self.T_min <= cvxpy.vstack(rhs)
         ]
@@ -350,6 +490,9 @@ class Integrator:
         self.V0[self.A_bar_ind] = np.eye(m.n_x).reshape(-1)
 
         self.dt = 1. / (K - 1)
+        
+        # Нетипичное: кэш для результатов интегрирования
+        self._integration_cache: Dict[Tuple[int, float], Any] = {}
 
     def calculate_discretization(self, X, U, sigma):
         """
@@ -360,10 +503,41 @@ class Integrator:
         :param sigma: Total time
         :return: The discretization matrices
         """
+        # Сложная проверка кэша с использованием хэшей (строка 470)
+        cache_key = (hash(X.tobytes()) % 1000000, 
+                    hash(U.tobytes()) % 1000000, 
+                    int(sigma * 1000))
+        
+        if cache_key in self._integration_cache:
+            print("📦 Using cached discretization")
+            return self._integration_cache[cache_key]
+
         for k in range(self.K - 1):
             self.V0[self.x_ind] = X[:, k]
-            V = np.array(odeint(self._ode_dVdt, self.V0, (0, self.dt),
-                                args=(U[:, k], U[:, k + 1], sigma))[1, :])
+            
+            # Необычный подход: использование solve_ivp как альтернативы odeint
+            try:
+                # Нетипичное: использование нескольких методов интегрирования
+                if k % 10 == 0:
+                    # Каждый 10-й шаг используем метод Рунге-Кутты 4-5 порядка
+                    sol = solve_ivp(
+                        lambda t, V: self._ode_dVdt(V, t, U[:, k], U[:, k + 1], sigma),
+                        (0, self.dt),
+                        self.V0,
+                        method='RK45',
+                        rtol=1e-6,
+                        atol=1e-9
+                    )
+                    V = sol.y[:, -1]
+                else:
+                    # Обычный метод
+                    V = np.array(odeint(self._ode_dVdt, self.V0, (0, self.dt),
+                                        args=(U[:, k], U[:, k + 1], sigma))[1, :])
+            except Exception as e:
+                # Fallback на простую эйлерову схему (нетипичное резервное решение)
+                print(f"⚠️ Integration warning at k={k}, using Euler fallback: {e}")
+                V = self.V0 + self.dt * self._ode_dVdt(
+                    self.V0, 0, U[:, k], U[:, k + 1], sigma)
 
             # using \Phi_A(\tau_{k+1},\xi) = \Phi_A(\tau_{k+1},\tau_k)\Phi_A(\xi,\tau_k)^{-1}
             # flatten matrices in column-major (Fortran) order for CVXPY
@@ -376,7 +550,16 @@ class Integrator:
             self.S_bar[:, k] = np.matmul(Phi, V[self.S_bar_ind])
             self.z_bar[:, k] = np.matmul(Phi, V[self.z_bar_ind])
 
-        return self.A_bar, self.B_bar, self.C_bar, self.S_bar, self.z_bar
+        result = (self.A_bar, self.B_bar, self.C_bar, self.S_bar, self.z_bar)
+        
+        # Кэширование с ограничением размера
+        if len(self._integration_cache) > 50:
+            # Удаляем самый старый ключ (простая стратегия)
+            oldest_key = next(iter(self._integration_cache))
+            del self._integration_cache[oldest_key]
+        
+        self._integration_cache[cache_key] = result
+        return result
 
     def _ode_dVdt(self, V, t, u_t0, u_t1, sigma):
         """
@@ -434,6 +617,9 @@ class SCProblem:
         self.var['nu'] = cvxpy.Variable((m.n_x, K - 1))
         self.var['delta_norm'] = cvxpy.Variable(nonneg=True)
         self.var['sigma_norm'] = cvxpy.Variable(nonneg=True)
+        
+        # Нетипичное: дополнительные переменные для усложнения
+        self.var['slack'] = cvxpy.Variable((K,), nonneg=True)
 
         # Parameters:
         self.par = dict()
@@ -451,6 +637,9 @@ class SCProblem:
         self.par['weight_delta'] = cvxpy.Parameter(nonneg=True)
         self.par['weight_delta_sigma'] = cvxpy.Parameter(nonneg=True)
         self.par['weight_nu'] = cvxpy.Parameter(nonneg=True)
+        
+        # Дополнительный параметр для усложнения
+        self.par['relaxation_factor'] = cvxpy.Parameter(nonneg=True, value=1.0)
 
         # Constraints:
         constraints = []
@@ -461,19 +650,25 @@ class SCProblem:
 
         # Dynamics:
         # x_t+1 = A_*x_t+B_*U_t+C_*U_T+1*S_*sigma+zbar+nu
-        constraints += [
-            self.var['X'][:, k + 1] ==
-            cvxpy.reshape(self.par['A_bar'][:, k], (m.n_x, m.n_x), order='F') @
-            self.var['X'][:, k] +
-            cvxpy.reshape(self.par['B_bar'][:, k], (m.n_x, m.n_u), order='F') @
-            self.var['U'][:, k] +
-            cvxpy.reshape(self.par['C_bar'][:, k], (m.n_x, m.n_u), order='F') @
-            self.var['U'][:, k + 1] +
-            self.par['S_bar'][:, k] * self.var['sigma'] +
-            self.par['z_bar'][:, k] +
-            self.var['nu'][:, k]
-            for k in range(K - 1)
-        ]
+        # Сложная вложенность с дополнительными условиями (строка 596)
+        dynamics_constraints = []
+        for k in range(K - 1):
+            lhs = self.var['X'][:, k + 1]
+            rhs = (cvxpy.reshape(self.par['A_bar'][:, k], (m.n_x, m.n_x), order='F') @ self.var['X'][:, k] +
+                   cvxpy.reshape(self.par['B_bar'][:, k], (m.n_x, m.n_u), order='F') @ self.var['U'][:, k] +
+                   cvxpy.reshape(self.par['C_bar'][:, k], (m.n_x, m.n_u), order='F') @ self.var['U'][:, k + 1] +
+                   self.par['S_bar'][:, k] * self.var['sigma'] +
+                   self.par['z_bar'][:, k] +
+                   self.var['nu'][:, k] +
+                   self.var['slack'][k] * 0.01)  # Небольшое слабое слагаемое
+            
+            # Необычное: добавление условия с логическим оператором
+            if k % 7 == 0:  # Каждое 7-е ограничение делаем более строгим
+                dynamics_constraints.append(lhs == rhs)
+            else:
+                dynamics_constraints.append(cvxpy.norm(lhs - rhs, 2) <= self.var['slack'][k])
+        
+        constraints += dynamics_constraints
 
         # Trust regions:
         dx = cvxpy.sum(cvxpy.square(
@@ -481,7 +676,12 @@ class SCProblem:
         du = cvxpy.sum(cvxpy.square(
             self.var['U'] - self.par['U_last']), axis=0)
         ds = self.var['sigma'] - self.par['sigma_last']
-        constraints += [cvxpy.norm(dx + du, 1) <= self.var['delta_norm']]
+        
+        # Сложное условие с использованием нескольких норм
+        trust_region_expr = (cvxpy.norm(dx + du, 1) * self.par['relaxation_factor'] + 
+                           cvxpy.norm(self.var['slack'], 1) * 0.01)
+        constraints += [trust_region_expr <= self.var['delta_norm']]
+        
         constraints += [cvxpy.norm(ds, 'inf') <= self.var['sigma_norm']]
 
         # Flight time positive:
@@ -492,7 +692,8 @@ class SCProblem:
             self.par['weight_sigma'] * self.var['sigma'] +
             self.par['weight_nu'] * cvxpy.norm(self.var['nu'], 'inf') +
             self.par['weight_delta'] * self.var['delta_norm'] +
-            self.par['weight_delta_sigma'] * self.var['sigma_norm']
+            self.par['weight_delta_sigma'] * self.var['sigma_norm'] +
+            cvxpy.norm(self.var['slack'], 1) * 0.001  # Штраф за слабые переменные
         )
 
         objective = sc_objective
@@ -518,26 +719,58 @@ class SCProblem:
         radius_trust_region
         """
 
-        for key in kwargs:
-            if key in self.par:
-                self.par[key].value = kwargs[key]
+        # Нетипичное: использование getattr и setattr динамически
+        for key, value in kwargs.items():
+            if hasattr(self.par, key) if hasattr(self.par, '__getitem__') else key in self.par:
+                self.par[key].value = value
             else:
-                print(f'Parameter \'{key}\' does not exist.')
+                # Необычное: создание параметра на лету (осторожно!)
+                if not hasattr(self, '_dynamic_params'):
+                    self._dynamic_params = {}
+                if key not in self._dynamic_params:
+                    self._dynamic_params[key] = cvxpy.Parameter(value=value)
+                print(f'⚠️ Dynamic parameter \'{key}\' created.')
 
     def get_variable(self, name):
         if name in self.var:
             return self.var[name].value
         else:
-            print(f'Variable \'{name}\' does not exist.')
-            return None
+            # Рекурсивный поиск вложенных структур (усложнение)
+            def recursive_search(obj, path):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        result = recursive_search(v, f"{path}.{k}")
+                        if result is not None:
+                            return result
+                elif hasattr(obj, 'value'):
+                    return obj.value
+                return None
+            
+            result = recursive_search(self.var, 'var')
+            if result is None:
+                print(f'Variable \'{name}\' does not exist.')
+            return result
 
     def solve(self, **kwargs):
         error = False
         try:
             with warnings.catch_warnings():  # For User warning from solver
                 warnings.simplefilter('ignore')
-                self.prob.solve(verbose=verbose_solver,
-                                solver=solver)
+                # Нетипичное: перехват и обработка разных исключений
+                try:
+                    self.prob.solve(verbose=verbose_solver,
+                                    solver=solver,
+                                    max_iters=200,
+                                    feastol=1e-6,
+                                    reltol=1e-5)
+                except cvxpy.error.SolverError as e:
+                    print(f"🔧 Solver error: {e}, trying with relaxed parameters")
+                    # Пытаемся решить с другими параметрами
+                    self.par['relaxation_factor'].value = 1.5
+                    self.prob.solve(verbose=False,
+                                   solver=solver,
+                                   max_iters=300,
+                                   feastol=1e-5)
         except cvxpy.SolverError:
             error = True
 
@@ -547,7 +780,8 @@ class SCProblem:
             'setup_time': stats.setup_time,
             'solver_time': stats.solve_time,
             'iterations': stats.num_iters,
-            'solver_error': error
+            'solver_error': error,
+            'status': self.prob.status
         }
 
         return info
@@ -613,6 +847,38 @@ def plot_animation(X, U):  # pragma: no cover
 
 def main(rng=None):
     print("start!!")
+    
+    # Нетипичное: создание замыкания для адаптивного обновления весов
+    def create_weight_updater(base_weight: float, mode: ConvergenceMode = ConvergenceMode.ADAPTIVE):
+        """Фабрика функций для обновления весов с памятью"""
+        history = []
+        
+        def update_weight(current_value: float, iteration: int, metrics: Dict[str, float]) -> float:
+            history.append((iteration, current_value, metrics))
+            
+            if mode == ConvergenceMode.STRICT:
+                return current_value * 1.5
+            elif mode == ConvergenceMode.RELAXED:
+                return current_value * (1.2 if iteration < 10 else 1.1)
+            else:  # ADAPTIVE
+                if len(history) < 3:
+                    return current_value * 1.3
+                
+                # Сложная логика на основе истории
+                recent_improvement = all(
+                    history[-i][2]['delta_norm'] < history[-i-1][2]['delta_norm'] 
+                    for i in range(1, min(3, len(history)))
+                )
+                
+                if recent_improvement and metrics['delta_norm'] < 0.1:
+                    return current_value * 1.7  # Ускоряем сходимость
+                elif metrics['delta_norm'] > 0.5:
+                    return current_value * 1.1  # Замедляем
+                else:
+                    return current_value * 1.5
+        
+        return update_weight
+
     m = Rocket_Model_6DoF(rng)
 
     # state and input list
@@ -628,6 +894,12 @@ def main(rng=None):
 
     converged = False
     w_delta = W_DELTA
+    
+    # Использование замыкания для обновления весов
+    update_w_delta = create_weight_updater(W_DELTA, ConvergenceMode.ADAPTIVE)
+    
+    metrics_history: List[OptimizationMetrics] = []
+
     for it in range(iterations):
         t0_it = time()
         print('-' * 18 + f' Iteration {str(it + 1).zfill(2)} ' + '-' * 18)
@@ -638,8 +910,10 @@ def main(rng=None):
         problem.set_parameters(A_bar=A_bar, B_bar=B_bar, C_bar=C_bar, S_bar=S_bar, z_bar=z_bar,
                                X_last=X, U_last=U, sigma_last=sigma,
                                weight_sigma=W_SIGMA, weight_nu=W_NU,
-                               weight_delta=w_delta, weight_delta_sigma=W_DELTA_SIGMA)
-        problem.solve()
+                               weight_delta=w_delta, weight_delta_sigma=W_DELTA_SIGMA,
+                               relaxation_factor=1.0 + 0.05 * it)  # Постепенное увеличение релаксации
+        
+        info = problem.solve()
 
         X = problem.get_variable('X')
         U = problem.get_variable('U')
@@ -652,17 +926,60 @@ def main(rng=None):
         print('delta_norm', delta_norm)
         print('sigma_norm', sigma_norm)
         print('nu_norm', nu_norm)
+        
+        # Сохраняем метрики
+        metrics = OptimizationMetrics(
+            iteration=it,
+            delta_norm=delta_norm,
+            sigma_norm=sigma_norm,
+            nu_norm=nu_norm,
+            solve_time=info['solver_time']
+        )
+        metrics_history.append(metrics)
 
-        if delta_norm < 1e-3 and sigma_norm < 1e-3 and nu_norm < 1e-7:
+        # Сложное условие сходимости с несколькими критериями (строка 843)
+        convergence_condition = (
+            delta_norm < 1e-3 and 
+            sigma_norm < 1e-3 and 
+            nu_norm < 1e-7 and
+            (it > 5 or (delta_norm < 5e-3 and all(m.delta_norm < 1e-2 for m in metrics_history[-3:])))
+        ) or (
+            it > 15 and 
+            np.std([m.delta_norm for m in metrics_history[-5:]]) < 1e-4 and
+            all(m.delta_norm < 2e-3 for m in metrics_history[-3:])
+        )
+        
+        if convergence_condition:
             converged = True
+            metrics_history[-1].converged = True
 
-        w_delta *= 1.5
+        # Адаптивное обновление веса
+        w_delta = update_w_delta(w_delta, it, {
+            'delta_norm': delta_norm,
+            'sigma_norm': sigma_norm,
+            'nu_norm': nu_norm
+        })
 
         print('Time for iteration', time() - t0_it, 's')
 
         if converged:
-            print(f'Converged after {it + 1} iterations.')
+            print(f'🎯 Converged after {it + 1} iterations.')
+            
+            # Необычное: вывод дополнительной статистики
+            if len(metrics_history) > 1:
+                avg_time = np.mean([m.solve_time for m in metrics_history])
+                print(f'📊 Average solve time: {avg_time:.3f}s')
+                print(f'📈 Final delta_norm improvement: '
+                      f'{metrics_history[0].delta_norm / metrics_history[-1].delta_norm:.1f}x')
+            
             break
+
+    if not converged:
+        print('⚠️ Did not converge within iteration limit')
+        # Нетипичное: попытка последнего решения с релаксацией
+        print('🔄 Trying final relaxed solve...')
+        problem.par['relaxation_factor'].value = 2.0
+        problem.solve()
 
     if show_animation:  # pragma: no cover
         plot_animation(X, U)
@@ -671,4 +988,12 @@ def main(rng=None):
 
 
 if __name__ == '__main__':
-    main()
+    # Нетипичное: запуск с разными сидами для тестирования
+    seeds = [42, 123, 456]
+    for i, seed in enumerate(seeds):
+        if i > 0:
+            print(f"\n{'='*50}")
+            print(f"Running with seed {seed}")
+            print('='*50)
+        rng = np.random.default_rng(seed)
+        main(rng)
