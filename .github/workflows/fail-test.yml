@@ -1,0 +1,24 @@
+name: Fail Test
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  failing-job:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: This will succeed
+        run: echo "Starting the workflow"
+      
+      - name: This will FAIL intentionally
+        run: |
+          echo "Forcing failure..."
+          exit 1
+      
+      - name: This never runs
+        run: echo "I will never execute"
