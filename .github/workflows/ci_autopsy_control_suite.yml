@@ -1,0 +1,127 @@
+name: CI Autopsy Control Suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      case:
+        description: "Synthetic failure case"
+        required: true
+        type: choice
+        options:
+          - deps_pip_missing_pkg
+          - config_env_missing
+          - paths_missing_file
+          - env_mismatch_python
+          - flaky_random
+          - test_pytest_assert
+          - compile_gcc_error
+          - network_timeout
+          - cache_artifact_missing
+
+jobs:
+  control:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print context
+      # Always run so log has environment hints.
+        run: |
+          echo "CI_AUTOPSY_CASE=${{ inputs.case }}"
+          uname -a
+          python --version || true
+          node --version || true
+          npm --version || true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run synthetic case
+        shell: bash
+        run: |
+          set -euxo pipefail
+          case "${{ inputs.case }}" in
+            deps_pip_missing_pkg)
+              cat > requirements.txt <<'EOF'
+              numpy==1.24.0
+              ml-ai-data-science-pro==2024.1
+              EOF
+              python -m pip install --upgrade pip
+              python -m pip install -r requirements.txt
+              ;;
+
+            config_env_missing)
+              python -c "import os; print(os.environ['MISSING_ENV'])"
+              ;;
+
+            paths_missing_file)
+              cat ./does/not/exist.txt
+              ;;
+
+            env_mismatch_python)
+              python -m pip install --upgrade pip
+              # Produce an explicit Requires-Python mismatch hint.
+              python - <<'PY'
+import sys
+print("python:", sys.version)
+print("ERROR: Ignored the following versions that require a different python version: 1.2.3 Requires-Python >=3.7,<3.11")
+raise SystemExit(1)
+PY
+              ;;
+
+            flaky_random)
+              # Intentionally ambiguous failure: looks flaky / timing-like.
+              python - <<'PY'
+import time, random
+time.sleep(1)
+print("Random failure without a stable signature")
+raise SystemExit(1)
+PY
+              ;;
+
+            test_pytest_assert)
+              python -m pip install --upgrade pip
+              python -m pip install pytest
+              mkdir -p tests
+              cat > tests/test_demo.py <<'PY'
+def test_demo():
+    assert 1 == 2
+PY
+              pytest -q
+              ;;
+
+            compile_gcc_error)
+              sudo apt-get update
+              sudo apt-get install -y build-essential
+              cat > bad.c <<'C'
+int main() {
+  return does_not_compile(
+}
+C
+              gcc bad.c -o bad
+              ;;
+
+            network_timeout)
+              # Prefer a timeout signature (better mapping to `timeout` than "error:" noise).
+              # 10.255.255.1 is commonly unroutable in private networks.
+              curl -sS --connect-timeout 2 --max-time 3 https://10.255.255.1 || true
+              echo "ETIMEDOUT: transient network timeout"
+              exit 1
+              ;;
+
+            cache_artifact_missing)
+              # Simulate common cache/artifact failure signatures.
+              echo "Cache not found for input keys: Linux-pip-abcdef123456"
+              echo "Failed to restore cache: checksum mismatch"
+              echo "Error: Artifact not found for name: build-logs"
+              exit 1
+              ;;
+
+            *)
+              echo "Unknown case"
+              exit 2
+              ;;
+          esac
